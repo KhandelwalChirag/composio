@@ -12,6 +12,7 @@ import {
   ToolRouterSessionExecuteResponse,
   ToolRouterSessionExecuteResponseSchema,
   ToolRouterSessionProxyExecuteResponse,
+  SmartToolExposureConfig,
 } from '../types/toolRouter.types';
 import {
   transformSearchResponse,
@@ -34,6 +35,7 @@ import type {
   RegisteredCustomToolkit,
 } from '../types/customTool.types';
 import type { ToolExecuteResponse } from '../types/tool.types';
+import type { Tool } from '../types/tool.types';
 import type { SessionProxyExecuteParams } from '../types/toolRouter.types';
 import { SessionProxyExecuteParamsSchema } from '../types/toolRouter.types';
 import { SessionContextImpl } from './SessionContext';
@@ -41,6 +43,8 @@ import { findCustomTool, executeCustomTool } from './customToolExecution';
 import { transformProxyParams } from './proxyParamsTransform';
 
 const COMPOSIO_MULTI_EXECUTE_TOOL = 'COMPOSIO_MULTI_EXECUTE_TOOL';
+const COMPOSIO_REFRESH_TOOLS = 'COMPOSIO_REFRESH_TOOLS';
+const MAX_RECENT_TOOL_TRACE = 20;
 
 export class ToolRouterSession<
   TToolCollection,
@@ -50,6 +54,10 @@ export class ToolRouterSession<
   public readonly sessionId: string;
   public readonly mcp: ToolRouterMCPServerConfig;
   public readonly experimental: SessionExperimental;
+  private readonly smartToolExposure?: SmartToolExposureConfig;
+  private readonly observedToolSlugs = new Set<string>();
+  private readonly recentToolTrace: string[] = [];
+  private readonly workflowTransitions = new Map<string, Map<string, number>>();
 
   /** Singleton session context — shared across all custom tool executions */
   private readonly sessionContext?: SessionContext;
@@ -61,15 +69,25 @@ export class ToolRouterSession<
     mcp: ToolRouterMCPServerConfig,
     experimentalOverrides?: Pick<SessionExperimental, 'assistivePrompt'>,
     private readonly customToolsMap?: CustomToolsMap,
-    private readonly userId?: string
+    private readonly userId?: string,
+    options?: { smartToolExposure?: SmartToolExposureConfig }
   ) {
     if (customToolsMap && !userId) {
       throw new Error('userId is required when custom tools are bound to a session.');
     }
     this.sessionId = sessionId;
     this.mcp = mcp;
+    this.smartToolExposure = options?.smartToolExposure;
     this.experimental = {
       assistivePrompt: experimentalOverrides?.assistivePrompt,
+      ...(this.smartToolExposure
+        ? {
+            smartToolExposure: {
+              enabled: this.smartToolExposure.enable,
+              mode: this.smartToolExposure.mode,
+            },
+          }
+        : {}),
       files: new ToolRouterSessionFilesMount(client, sessionId),
     };
 
@@ -94,6 +112,7 @@ export class ToolRouterSession<
       this.sessionId,
       modifiers?.modifySchema ? { modifySchema: modifiers.modifySchema } : undefined
     );
+    const smartTools = this.withSmartToolExposureMetaTool(tools);
 
     if (this.hasCustomTools()) {
       // Create an execute function that splits local/remote tools in COMPOSIO_MULTI_EXECUTE_TOOL
@@ -103,6 +122,10 @@ export class ToolRouterSession<
       ): Promise<ToolExecuteResponse> => {
         if (toolSlug === COMPOSIO_MULTI_EXECUTE_TOOL) {
           return this.routeMultiExecute(input, ToolsModel, modifiers);
+        }
+        if (toolSlug === COMPOSIO_REFRESH_TOOLS) {
+          const refreshed = this.refreshToolExposureState(input);
+          return { data: refreshed, error: null, successful: true };
         }
         // Non-multi-execute meta tools always go to backend
         return ToolsModel.executeMetaTool(
@@ -118,13 +141,38 @@ export class ToolRouterSession<
             'Pass a provider in the Composio constructor.'
         );
       }
-      return this.config.provider.wrapTools(tools, routingExecuteFn) as ReturnType<
+      return this.config.provider.wrapTools(smartTools, routingExecuteFn) as ReturnType<
+        TProvider['wrapTools']
+      >;
+    }
+
+    if (this.isSmartToolExposureEnabled()) {
+      if (!this.config?.provider) {
+        throw new Error(
+          'A provider is required when using session.tools() with Smart MCP Tool Exposure enabled.'
+        );
+      }
+      const routingExecuteFn = async (
+        toolSlug: string,
+        input: Record<string, unknown>
+      ): Promise<ToolExecuteResponse> => {
+        if (toolSlug === COMPOSIO_REFRESH_TOOLS) {
+          const refreshed = this.refreshToolExposureState(input);
+          return { data: refreshed, error: null, successful: true };
+        }
+        return ToolsModel.executeMetaTool(
+          toolSlug,
+          { sessionId: this.sessionId, arguments: input },
+          modifiers
+        );
+      };
+      return this.config.provider.wrapTools(smartTools, routingExecuteFn) as ReturnType<
         TProvider['wrapTools']
       >;
     }
 
     // Standard path (no local tools)
-    const wrappedTools = ToolsModel.wrapToolsForToolRouter(this.sessionId, tools, modifiers);
+    const wrappedTools = ToolsModel.wrapToolsForToolRouter(this.sessionId, smartTools, modifiers);
     return wrappedTools as ReturnType<TProvider['wrapTools']>;
   }
 
@@ -272,7 +320,8 @@ export class ToolRouterSession<
       ...(params.toolkits?.length ? { toolkits: params.toolkits } : {}),
     });
     const transformed = transformSearchResponse(response);
-    return ToolRouterSessionSearchResponseSchema.parse(transformed);
+    const parsed = ToolRouterSessionSearchResponseSchema.parse(transformed);
+    return this.applySmartToolExposureToSearchResults(parsed, params.query);
   }
 
   /**
@@ -290,10 +339,19 @@ export class ToolRouterSession<
     toolSlug: string,
     arguments_?: Record<string, unknown>
   ): Promise<ToolRouterSessionExecuteResponse> {
+    if (toolSlug.toUpperCase() === COMPOSIO_REFRESH_TOOLS && this.isSmartToolExposureEnabled()) {
+      return {
+        data: this.refreshToolExposureState(arguments_ ?? {}),
+        error: null,
+        logId: '',
+      };
+    }
+
     // Check if this is a local tool (by original or final slug)
     const entry = findCustomTool(this.customToolsMap, toolSlug);
     if (entry) {
       const result = await executeCustomTool(entry, arguments_ ?? {}, this.sessionContext!);
+      this.recordObservedToolUsage(entry.finalSlug);
       return {
         data: result.data,
         error: result.error,
@@ -306,6 +364,7 @@ export class ToolRouterSession<
       tool_slug: toolSlug,
       arguments: arguments_ ?? {},
     });
+    this.recordObservedToolUsage(toolSlug);
     const transformed = transformExecuteResponse(response);
     return ToolRouterSessionExecuteResponseSchema.parse(transformed);
   }
@@ -353,6 +412,189 @@ export class ToolRouterSession<
   /** Check if this session has any custom tools bound. */
   private hasCustomTools(): boolean {
     return (this.customToolsMap?.byFinalSlug.size ?? 0) > 0;
+  }
+
+  private isSmartToolExposureEnabled(): boolean {
+    return this.smartToolExposure?.enable === true;
+  }
+
+  private withSmartToolExposureMetaTool(tools: Tool[]): Tool[] {
+    if (!this.isSmartToolExposureEnabled()) {
+      return tools;
+    }
+    if (tools.some(tool => tool.slug === COMPOSIO_REFRESH_TOOLS)) {
+      return tools;
+    }
+    const refreshTool: Tool = {
+      slug: COMPOSIO_REFRESH_TOOLS,
+      name: 'Refresh Tools',
+      description:
+        'Refresh smart MCP tool exposure state. Optionally clear learned context or keep active tools locked.',
+      toolkit: { slug: 'composio', name: 'Composio' },
+      tags: ['meta', 'session'],
+      inputParameters: {
+        type: 'object',
+        properties: {
+          keepCurrent: {
+            type: 'boolean',
+            description: 'When true, keep observed active tools and workflow traces.',
+            default: true,
+          },
+        },
+        required: [],
+        additionalProperties: false,
+      },
+      outputParameters: {
+        type: 'object',
+        properties: {
+          refreshed: { type: 'boolean' },
+          keepCurrent: { type: 'boolean' },
+          observedToolCount: { type: 'number' },
+          mode: { type: 'string' },
+        },
+        required: ['refreshed', 'keepCurrent'],
+        additionalProperties: false,
+      },
+    };
+    return [...tools, refreshTool];
+  }
+
+  private refreshToolExposureState(input: Record<string, unknown>) {
+    const keepCurrent = input.keepCurrent !== false;
+    if (!keepCurrent) {
+      this.observedToolSlugs.clear();
+      this.recentToolTrace.length = 0;
+      this.workflowTransitions.clear();
+    }
+    return {
+      refreshed: true,
+      keepCurrent,
+      observedToolCount: this.observedToolSlugs.size,
+      mode: this.smartToolExposure?.mode ?? 'shadow',
+    };
+  }
+
+  private recordObservedToolUsage(toolSlug: string): void {
+    const normalized = toolSlug.toUpperCase();
+    if (normalized.startsWith('COMPOSIO_')) {
+      return;
+    }
+    this.observedToolSlugs.add(normalized);
+    const last = this.recentToolTrace[this.recentToolTrace.length - 1];
+    if (last) {
+      const transitions = this.workflowTransitions.get(last) ?? new Map<string, number>();
+      transitions.set(normalized, (transitions.get(normalized) ?? 0) + 1);
+      this.workflowTransitions.set(last, transitions);
+    }
+    this.recentToolTrace.push(normalized);
+    if (this.recentToolTrace.length > MAX_RECENT_TOOL_TRACE) {
+      this.recentToolTrace.splice(0, this.recentToolTrace.length - MAX_RECENT_TOOL_TRACE);
+    }
+  }
+
+  private applySmartToolExposureToSearchResults(
+    response: ToolRouterSessionSearchResponse,
+    query: string
+  ): ToolRouterSessionSearchResponse {
+    if (!this.isSmartToolExposureEnabled() || response.results.length === 0) {
+      return response;
+    }
+
+    const queryTokens = this.tokenize(query);
+    const recent = new Set(this.recentToolTrace);
+    const mandatoryTools = new Set(
+      (this.smartToolExposure?.mandatoryTools ?? []).map(s => s.toUpperCase())
+    );
+    const mandatoryToolkits = new Set(
+      (this.smartToolExposure?.mandatoryToolkits ?? []).map(s => s.toLowerCase())
+    );
+    const previous = this.recentToolTrace[this.recentToolTrace.length - 1];
+    const transitionMap = previous ? this.workflowTransitions.get(previous) : undefined;
+    const maxTransition = transitionMap ? Math.max(...Array.from(transitionMap.values()), 1) : 1;
+
+    const scored = response.results.map(result => {
+      const primary = result.primaryToolSlugs.map(s => s.toUpperCase());
+      const related = result.relatedToolSlugs.map(s => s.toUpperCase());
+      const toolkits = result.toolkits.map(t => t.toLowerCase());
+
+      const corpus = `${result.useCase} ${primary.join(' ')} ${related.join(' ')} ${toolkits.join(' ')}`;
+      const corpusTokens = this.tokenize(corpus);
+      const semanticHits = queryTokens.filter(token => corpusTokens.includes(token)).length;
+      const semanticScore = queryTokens.length > 0 ? semanticHits / queryTokens.length : 0;
+
+      const transitionBoost = transitionMap
+        ? [...primary, ...related].reduce((acc, slug) => {
+            const count = transitionMap.get(slug) ?? 0;
+            return Math.max(acc, count / maxTransition);
+          }, 0)
+        : 0;
+
+      const recencyBoost =
+        [...primary, ...related].filter(slug => recent.has(slug)).length /
+        Math.max(primary.length + related.length, 1);
+
+      const taxonomyBoost =
+        (toolkits.some(t => mandatoryToolkits.has(t)) ? 0.5 : 0) +
+        ([...primary, ...related].some(slug => mandatoryTools.has(slug)) ? 0.5 : 0);
+
+      const score =
+        semanticScore * 0.45 + transitionBoost * 0.2 + recencyBoost * 0.2 + taxonomyBoost * 0.15;
+
+      const activeSetLocked = [...primary, ...related].some(slug =>
+        this.observedToolSlugs.has(slug)
+      );
+      const mandatoryLocked =
+        toolkits.some(t => mandatoryToolkits.has(t)) ||
+        [...primary, ...related].some(slug => mandatoryTools.has(slug));
+
+      return {
+        score,
+        result,
+        activeSetLocked,
+        mandatoryLocked,
+      };
+    });
+
+    const ranked = [...scored].sort((a, b) => b.score - a.score);
+    const mode = this.smartToolExposure?.mode ?? 'shadow';
+    const bestScore = ranked[0]?.score ?? 0;
+    const confidenceThreshold = this.smartToolExposure?.confidenceThreshold ?? 0.2;
+    if (bestScore < confidenceThreshold) {
+      return response;
+    }
+
+    if (mode === 'shadow') {
+      return {
+        ...response,
+        results: ranked.map(item => item.result),
+      };
+    }
+
+    const defaultTopK = mode === 'soft' ? 12 : 6;
+    const topK = this.smartToolExposure?.topK ?? defaultTopK;
+    const filtered = ranked.filter(
+      (item, index) => index < topK || item.activeSetLocked || item.mandatoryLocked
+    );
+    const retainedToolSlugs = new Set(
+      filtered.flatMap(item => [...item.result.primaryToolSlugs, ...item.result.relatedToolSlugs])
+    );
+    const filteredToolSchemas = Object.fromEntries(
+      Object.entries(response.toolSchemas).filter(([slug]) => retainedToolSlugs.has(slug))
+    );
+
+    return {
+      ...response,
+      results: filtered.map(item => item.result),
+      toolSchemas: filteredToolSchemas,
+    };
+  }
+
+  private tokenize(value: string): string[] {
+    return value
+      .toLowerCase()
+      .split(/[^a-z0-9_]+/g)
+      .map(token => token.trim())
+      .filter(Boolean);
   }
 
   /** Parse an individual tool item from COMPOSIO_MULTI_EXECUTE_TOOL's tools array */

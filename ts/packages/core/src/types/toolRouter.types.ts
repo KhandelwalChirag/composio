@@ -261,6 +261,47 @@ export const ToolRouterCreateSessionConfigSchema = z
           .describe(
             'Custom toolkits to include in this session. Created via createCustomToolkit() from @composio/core/experimental.'
           ),
+        smartToolExposure: z
+          .object({
+            enable: z
+              .boolean()
+              .optional()
+              .default(false)
+              .describe(
+                'Enable adaptive smart MCP tool exposure for discovery/filtering in this session.'
+              ),
+            mode: z
+              .enum(['shadow', 'soft', 'strict'])
+              .optional()
+              .default('shadow')
+              .describe(
+                'Rollout mode for smart tool exposure: shadow (rank only), soft (light filtering), strict (aggressive filtering).'
+              ),
+            topK: z
+              .number()
+              .int()
+              .min(1)
+              .optional()
+              .describe('Maximum number of search results to retain when filtering is active.'),
+            confidenceThreshold: z
+              .number()
+              .min(0)
+              .max(1)
+              .optional()
+              .describe(
+                'Confidence threshold below which filtering falls back to unfiltered results.'
+              ),
+            mandatoryTools: z
+              .array(z.string())
+              .optional()
+              .describe('Tool slugs that must always be preserved in discovery results.'),
+            mandatoryToolkits: z
+              .array(z.string())
+              .optional()
+              .describe('Toolkit slugs whose tools should be preserved in discovery results.'),
+          })
+          .optional()
+          .describe('Smart MCP tool exposure configuration (experimental).'),
       })
       .optional()
       .describe('Experimental features configuration - not stable, may be modified or removed'),
@@ -288,6 +329,16 @@ export const ToolRouterCreateSessionConfigSchema = z
  * @param {boolean} [multiAccount.requireExplicitSelection] - When true, require explicit account selection when multiple accounts are connected
  */
 export type ToolRouterCreateSessionConfig = z.infer<typeof ToolRouterCreateSessionConfigSchema>;
+
+export const SmartToolExposureConfigSchema = z.object({
+  enable: z.boolean().default(false),
+  mode: z.enum(['shadow', 'soft', 'strict']).default('shadow'),
+  topK: z.number().int().min(1).optional(),
+  confidenceThreshold: z.number().min(0).max(1).optional(),
+  mandatoryTools: z.array(z.string()).optional(),
+  mandatoryToolkits: z.array(z.string()).optional(),
+});
+export type SmartToolExposureConfig = z.infer<typeof SmartToolExposureConfigSchema>;
 
 export const ToolkitConnectionStateSchema = z
   .object({
@@ -474,6 +525,11 @@ export interface SessionExperimental {
    * Only returned on session creation, not on GET.
    */
   assistivePrompt?: string;
+  /** Smart MCP tool exposure runtime info for this session (experimental). */
+  smartToolExposure?: {
+    enabled: boolean;
+    mode: 'shadow' | 'soft' | 'strict';
+  };
   /**
    * File mount operations (list, upload, download, delete) for the session's virtual filesystem.
    */

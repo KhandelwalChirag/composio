@@ -43,8 +43,22 @@ import { findCustomTool, executeCustomTool } from './customToolExecution';
 import { transformProxyParams } from './proxyParamsTransform';
 
 const COMPOSIO_MULTI_EXECUTE_TOOL = 'COMPOSIO_MULTI_EXECUTE_TOOL';
-const COMPOSIO_REFRESH_TOOLS = 'COMPOSIO_REFRESH_TOOLS';
+const SMART_EXPOSURE_REFRESH_TOOL_SLUG = 'COMPOSIO_REFRESH_TOOLS';
+// Keep a short rolling window of recent tool calls for recency + transition scoring.
 const MAX_RECENT_TOOL_TRACE = 20;
+const MAX_TRANSITION_COUNT = 1000;
+const SMART_EXPOSURE_SCORE_WEIGHTS = {
+  semantic: 0.45,
+  transition: 0.2,
+  recency: 0.2,
+  taxonomy: 0.15,
+} as const;
+const DEFAULT_SMART_EXPOSURE_CONFIDENCE_THRESHOLD = 0.2;
+// Soft mode keeps a broader candidate set; strict mode is tighter for large tool inventories.
+const DEFAULT_SMART_EXPOSURE_TOP_K = {
+  soft: 12,
+  strict: 6,
+} as const;
 
 export class ToolRouterSession<
   TToolCollection,
@@ -123,7 +137,7 @@ export class ToolRouterSession<
         if (toolSlug === COMPOSIO_MULTI_EXECUTE_TOOL) {
           return this.routeMultiExecute(input, ToolsModel, modifiers);
         }
-        if (toolSlug === COMPOSIO_REFRESH_TOOLS) {
+        if (toolSlug === SMART_EXPOSURE_REFRESH_TOOL_SLUG) {
           const refreshed = this.refreshToolExposureState(input);
           return { data: refreshed, error: null, successful: true };
         }
@@ -156,7 +170,7 @@ export class ToolRouterSession<
         toolSlug: string,
         input: Record<string, unknown>
       ): Promise<ToolExecuteResponse> => {
-        if (toolSlug === COMPOSIO_REFRESH_TOOLS) {
+        if (toolSlug === SMART_EXPOSURE_REFRESH_TOOL_SLUG) {
           const refreshed = this.refreshToolExposureState(input);
           return { data: refreshed, error: null, successful: true };
         }
@@ -339,7 +353,10 @@ export class ToolRouterSession<
     toolSlug: string,
     arguments_?: Record<string, unknown>
   ): Promise<ToolRouterSessionExecuteResponse> {
-    if (toolSlug.toUpperCase() === COMPOSIO_REFRESH_TOOLS && this.isSmartToolExposureEnabled()) {
+    if (
+      toolSlug.toUpperCase() === SMART_EXPOSURE_REFRESH_TOOL_SLUG &&
+      this.isSmartToolExposureEnabled()
+    ) {
       return {
         data: this.refreshToolExposureState(arguments_ ?? {}),
         error: null,
@@ -422,11 +439,11 @@ export class ToolRouterSession<
     if (!this.isSmartToolExposureEnabled()) {
       return tools;
     }
-    if (tools.some(tool => tool.slug === COMPOSIO_REFRESH_TOOLS)) {
+    if (tools.some(tool => tool.slug === SMART_EXPOSURE_REFRESH_TOOL_SLUG)) {
       return tools;
     }
     const refreshTool: Tool = {
-      slug: COMPOSIO_REFRESH_TOOLS,
+      slug: SMART_EXPOSURE_REFRESH_TOOL_SLUG,
       name: 'Refresh Tools',
       description:
         'Refresh smart MCP tool exposure state. Optionally clear learned context or keep active tools locked.',
@@ -483,7 +500,8 @@ export class ToolRouterSession<
     const last = this.recentToolTrace[this.recentToolTrace.length - 1];
     if (last) {
       const transitions = this.workflowTransitions.get(last) ?? new Map<string, number>();
-      transitions.set(normalized, (transitions.get(normalized) ?? 0) + 1);
+      const nextCount = Math.min((transitions.get(normalized) ?? 0) + 1, MAX_TRANSITION_COUNT);
+      transitions.set(normalized, nextCount);
       this.workflowTransitions.set(last, transitions);
     }
     this.recentToolTrace.push(normalized);
@@ -538,7 +556,10 @@ export class ToolRouterSession<
         ([...primary, ...related].some(slug => mandatoryTools.has(slug)) ? 0.5 : 0);
 
       const score =
-        semanticScore * 0.45 + transitionBoost * 0.2 + recencyBoost * 0.2 + taxonomyBoost * 0.15;
+        semanticScore * SMART_EXPOSURE_SCORE_WEIGHTS.semantic +
+        transitionBoost * SMART_EXPOSURE_SCORE_WEIGHTS.transition +
+        recencyBoost * SMART_EXPOSURE_SCORE_WEIGHTS.recency +
+        taxonomyBoost * SMART_EXPOSURE_SCORE_WEIGHTS.taxonomy;
 
       const activeSetLocked = [...primary, ...related].some(slug =>
         this.observedToolSlugs.has(slug)
@@ -558,7 +579,8 @@ export class ToolRouterSession<
     const ranked = [...scored].sort((a, b) => b.score - a.score);
     const mode = this.smartToolExposure?.mode ?? 'shadow';
     const bestScore = ranked[0]?.score ?? 0;
-    const confidenceThreshold = this.smartToolExposure?.confidenceThreshold ?? 0.2;
+    const confidenceThreshold =
+      this.smartToolExposure?.confidenceThreshold ?? DEFAULT_SMART_EXPOSURE_CONFIDENCE_THRESHOLD;
     if (bestScore < confidenceThreshold) {
       return response;
     }
@@ -570,7 +592,8 @@ export class ToolRouterSession<
       };
     }
 
-    const defaultTopK = mode === 'soft' ? 12 : 6;
+    const defaultTopK =
+      mode === 'soft' ? DEFAULT_SMART_EXPOSURE_TOP_K.soft : DEFAULT_SMART_EXPOSURE_TOP_K.strict;
     const topK = this.smartToolExposure?.topK ?? defaultTopK;
     const filtered = ranked.filter(
       (item, index) => index < topK || item.activeSetLocked || item.mandatoryLocked

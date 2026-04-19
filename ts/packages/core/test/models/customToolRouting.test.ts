@@ -96,7 +96,7 @@ const createSessionWithProvider = (
   client: ReturnType<typeof createMockClient>,
   provider: MockProvider,
   customTools: CustomTool[],
-  options?: { smartToolExposure?: SmartToolExposureConfig }
+  sessionOptions?: { smartToolExposure?: SmartToolExposureConfig }
 ) => {
   return new ToolRouterSession(
     client as unknown as ComposioClient,
@@ -106,7 +106,7 @@ const createSessionWithProvider = (
     undefined,
     buildCustomToolsMap(customTools),
     'user_1',
-    options
+    sessionOptions
   );
 };
 
@@ -197,7 +197,7 @@ describe('ToolRouterSession execution routing', () => {
   const createSession = (
     client: ReturnType<typeof createMockClient>,
     customTools: CustomTool[] = [],
-    options?: { smartToolExposure?: SmartToolExposureConfig }
+    sessionOptions?: { smartToolExposure?: SmartToolExposureConfig }
   ) => {
     const customToolsMap = customTools.length ? buildCustomToolsMap(customTools) : undefined;
 
@@ -209,7 +209,7 @@ describe('ToolRouterSession execution routing', () => {
       undefined,
       customToolsMap,
       'user_1',
-      options
+      sessionOptions
     );
   };
 

@@ -1440,6 +1440,51 @@ describe('ToolRouter', () => {
         expect(session.experimental.assistivePrompt).toBeUndefined();
         expect(session.experimental.files).toBeDefined();
       });
+
+      it('should expose smartToolExposure runtime info when configured', async () => {
+        mockClient.toolRouter.session.create.mockResolvedValueOnce(mockSessionCreateResponse);
+
+        const session = await toolRouter.create(userId, {
+          experimental: {
+            smartToolExposure: {
+              enable: true,
+              mode: 'strict',
+              topK: 5,
+            },
+          },
+        });
+
+        expect(session.experimental.smartToolExposure).toEqual({
+          enabled: true,
+          mode: 'strict',
+        });
+      });
+
+      it('should not include smartToolExposure in backend create payload', async () => {
+        mockClient.toolRouter.session.create.mockResolvedValueOnce(mockSessionCreateResponse);
+
+        await toolRouter.create(userId, {
+          experimental: {
+            smartToolExposure: {
+              enable: true,
+              mode: 'soft',
+            },
+          },
+        });
+
+        expect(mockClient.toolRouter.session.create).toHaveBeenCalledWith({
+          user_id: userId,
+          toolkits: undefined,
+          auth_configs: undefined,
+          connected_accounts: undefined,
+          tools: undefined,
+          tags: undefined,
+          manage_connections: createExpectedManageConnections(),
+          workbench: undefined,
+          multi_account: undefined,
+          experimental: undefined,
+        });
+      });
     });
 
     describe('error handling', () => {

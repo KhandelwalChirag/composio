@@ -24,15 +24,12 @@ import { ComposioConfig } from '../composio';
 import {
   ToolRouterCreateSessionConfig,
   Session,
-  SessionExperimental,
   MCPServerType,
   ToolRouterMCPServerConfig,
+  SmartToolExposureConfigSchema,
 } from '../types/toolRouter.types';
 import { ToolRouterCreateSessionConfigSchema } from '../types/toolRouter.types';
-import {
-  SessionCreateParams,
-  SessionCreateResponse,
-} from '@composio/client/resources/tool-router/session/session.mjs';
+import { SessionCreateParams } from '@composio/client/resources/tool-router/session/session.mjs';
 import {
   transformToolRouterTagsParams,
   transformToolRouterToolsParams,
@@ -157,6 +154,9 @@ export class ToolRouter<
     }
 
     const assistivePrompt = session.experimental?.assistive_prompt;
+    const smartToolExposureConfig = routerConfig.experimental?.smartToolExposure
+      ? SmartToolExposureConfigSchema.parse(routerConfig.experimental.smartToolExposure)
+      : undefined;
 
     return new ToolRouterSession<TToolCollection, TTool, TProvider>(
       this.client,
@@ -165,7 +165,8 @@ export class ToolRouter<
       this.createMCPServerConfig(session.mcp),
       { assistivePrompt },
       customToolsMap,
-      userId
+      userId,
+      { smartToolExposure: smartToolExposureConfig }
     );
   }
 

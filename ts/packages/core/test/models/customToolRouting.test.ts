@@ -7,6 +7,7 @@ import { MockProvider } from '../utils/mocks/provider.mock';
 import ComposioClient from '@composio/client';
 import { Tools } from '../../src/models/Tools';
 import type { CustomTool } from '../../src/types/customTool.types';
+import type { SmartToolExposureConfig } from '../../src/types/toolRouter.types';
 
 // Mock telemetry
 vi.mock('../../src/telemetry/Telemetry', () => ({
@@ -94,7 +95,8 @@ const sessionToolHandle = createCustomTool('GET_AD_ACCOUNTS', {
 const createSessionWithProvider = (
   client: ReturnType<typeof createMockClient>,
   provider: MockProvider,
-  customTools: CustomTool[]
+  customTools: CustomTool[],
+  sessionOptions?: { smartToolExposure?: SmartToolExposureConfig }
 ) => {
   return new ToolRouterSession(
     client as unknown as ComposioClient,
@@ -103,7 +105,8 @@ const createSessionWithProvider = (
     { type: 'http' as const, url: 'https://mcp.example.com/sess_123' },
     undefined,
     buildCustomToolsMap(customTools),
-    'user_1'
+    'user_1',
+    sessionOptions
   );
 };
 
@@ -193,7 +196,8 @@ describe('ToolRouterSession execution routing', () => {
 
   const createSession = (
     client: ReturnType<typeof createMockClient>,
-    customTools: CustomTool[] = []
+    customTools: CustomTool[] = [],
+    sessionOptions?: { smartToolExposure?: SmartToolExposureConfig }
   ) => {
     const customToolsMap = customTools.length ? buildCustomToolsMap(customTools) : undefined;
 
@@ -204,7 +208,8 @@ describe('ToolRouterSession execution routing', () => {
       { type: 'http' as const, url: 'https://mcp.example.com/sess_123' },
       undefined,
       customToolsMap,
-      'user_1'
+      'user_1',
+      sessionOptions
     );
   };
 
@@ -949,6 +954,127 @@ describe('ToolRouterSession execution routing', () => {
       expect(local.response.data).toEqual({ local_result: true });
       expect(gmail.response.data).toEqual({ message_id: 'msg_1' });
       expect(slack.response.data).toEqual({ ts: '123456' });
+    });
+  });
+
+  describe('smart MCP tool exposure', () => {
+    const makeSearchResponse = () => ({
+      success: true,
+      error: null,
+      results: [
+        {
+          index: 0,
+          use_case: 'create github issue',
+          primary_tool_slugs: ['GITHUB_CREATE_ISSUE'],
+          related_tool_slugs: [],
+          toolkits: ['github'],
+        },
+        {
+          index: 1,
+          use_case: 'send slack message',
+          primary_tool_slugs: ['SLACK_POST_MESSAGE'],
+          related_tool_slugs: [],
+          toolkits: ['slack'],
+        },
+        {
+          index: 2,
+          use_case: 'send gmail email',
+          primary_tool_slugs: ['GMAIL_SEND_EMAIL'],
+          related_tool_slugs: [],
+          toolkits: ['gmail'],
+        },
+      ],
+      tool_schemas: {
+        GITHUB_CREATE_ISSUE: { tool_slug: 'GITHUB_CREATE_ISSUE', toolkit: 'github' },
+        SLACK_POST_MESSAGE: { tool_slug: 'SLACK_POST_MESSAGE', toolkit: 'slack' },
+        GMAIL_SEND_EMAIL: { tool_slug: 'GMAIL_SEND_EMAIL', toolkit: 'gmail' },
+      },
+      toolkit_connection_statuses: [],
+      next_steps_guidance: [],
+      session: { id: 'sess_123', generate_id: false, instructions: '' },
+      time_info: {
+        current_time_utc: '2026-01-01T00:00:00Z',
+        current_time_utc_epoch_seconds: 0,
+        message: '',
+      },
+    });
+
+    it('should append COMPOSIO_REFRESH_TOOLS to session.tools() when enabled and execute it', async () => {
+      const provider = new MockProvider();
+      captureExecuteFn(provider);
+      const session = createSessionWithProvider(mockClient, provider, [], {
+        smartToolExposure: { enable: true, mode: 'soft' },
+      });
+
+      await session.tools();
+      const capturedTools = (provider as any)._capturedTools as Array<{ slug: string }>;
+      const executeFn = (provider as any)._capturedExecuteFn;
+
+      expect(capturedTools.map(t => t.slug)).toContain('COMPOSIO_REFRESH_TOOLS');
+      const result = await executeFn('COMPOSIO_REFRESH_TOOLS', { keepCurrent: false });
+      expect(result.successful).toBe(true);
+      expect(result.data).toMatchObject({
+        refreshed: true,
+        keepCurrent: false,
+        mode: 'soft',
+      });
+    });
+
+    it('should preserve mandatory and active-set tools even in strict topK filtering', async () => {
+      mockClient.toolRouter.session.search.mockResolvedValue(makeSearchResponse());
+      const session = createSession(mockClient, [], {
+        smartToolExposure: {
+          enable: true,
+          mode: 'strict',
+          topK: 1,
+          confidenceThreshold: 0,
+          mandatoryTools: ['GITHUB_CREATE_ISSUE'],
+        },
+      });
+
+      await session.execute('GMAIL_SEND_EMAIL', { to: 'a@b.com' });
+      const result = await session.search({ query: 'send slack message' });
+      const primaryTools = result.results.map(r => r.primaryToolSlugs[0]);
+
+      expect(primaryTools).toContain('SLACK_POST_MESSAGE');
+      expect(primaryTools).toContain('GITHUB_CREATE_ISSUE');
+      expect(primaryTools).toContain('GMAIL_SEND_EMAIL');
+    });
+
+    it('should fallback to unfiltered results when confidence is below threshold', async () => {
+      mockClient.toolRouter.session.search.mockResolvedValue(makeSearchResponse());
+      const session = createSession(mockClient, [], {
+        smartToolExposure: {
+          enable: true,
+          mode: 'strict',
+          topK: 1,
+          confidenceThreshold: 0.95,
+        },
+      });
+
+      const result = await session.search({ query: 'qzxvunknownintent' });
+      expect(result.results).toHaveLength(3);
+      expect(Object.keys(result.toolSchemas)).toHaveLength(3);
+    });
+
+    it('should clear observed active tools when refreshed with keepCurrent=false', async () => {
+      mockClient.toolRouter.session.search.mockResolvedValue(makeSearchResponse());
+      const session = createSession(mockClient, [], {
+        smartToolExposure: {
+          enable: true,
+          mode: 'strict',
+          topK: 1,
+          confidenceThreshold: 0,
+        },
+      });
+
+      await session.execute('GMAIL_SEND_EMAIL', { to: 'x@y.com' });
+      await session.execute('COMPOSIO_REFRESH_TOOLS', { keepCurrent: false });
+      const result = await session.search({ query: 'send slack message' });
+      const primaryTools = result.results.map(r => r.primaryToolSlugs[0]);
+
+      expect(primaryTools).toContain('SLACK_POST_MESSAGE');
+      expect(primaryTools).not.toContain('GMAIL_SEND_EMAIL');
     });
   });
 

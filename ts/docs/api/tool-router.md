@@ -237,8 +237,8 @@ Configure workbench behavior for tool execution:
 const session = await composio.create('user_123', {
   toolkits: ['gmail'],
   workbench: {
-    enable: false
-  }
+    enable: false,
+  },
 });
 
 // Fine-tune workbench settings
@@ -252,11 +252,11 @@ const session2 = await composio.create('user_123', {
 });
 ```
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `enable` | `boolean` | `true` | Enables/disables the workbench entirely. When `false`, `COMPOSIO_REMOTE_WORKBENCH` and `COMPOSIO_REMOTE_BASH_TOOL` are excluded from the session. |
-| `enableProxyExecution` | `boolean` | `true` | Controls proxy API execution in the workbench. |
-| `autoOffloadThreshold` | `number` | auto | Character threshold for auto-offloading large responses to the workbench. |
+| Field                  | Type      | Default | Description                                                                                                                                       |
+| ---------------------- | --------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enable`               | `boolean` | `true`  | Enables/disables the workbench entirely. When `false`, `COMPOSIO_REMOTE_WORKBENCH` and `COMPOSIO_REMOTE_BASH_TOOL` are excluded from the session. |
+| `enableProxyExecution` | `boolean` | `true`  | Controls proxy API execution in the workbench.                                                                                                    |
+| `autoOffloadThreshold` | `number`  | auto    | Character threshold for auto-offloading large responses to the workbench.                                                                         |
 
 ### `experimental`
 
@@ -363,6 +363,46 @@ await session.execute('SED', { pattern: 'foo', replacement: 'bar' });
 ```
 
 Custom tools are searched alongside Composio tools. When the LLM calls a custom tool, the SDK executes it in-process — remote tools in the same batch are sent to the backend in parallel.
+
+#### Smart MCP Tool Exposure (Experimental)
+
+Smart MCP Tool Exposure adds an opt-in adaptive discovery layer for high-tool-count sessions. It does **not** replace Tool Router execution/auth flows.
+
+```typescript
+const session = await composio.create('user_123', {
+  experimental: {
+    smartToolExposure: {
+      enable: true,
+      mode: 'soft', // 'shadow' | 'soft' | 'strict'
+      topK: 12,
+      confidenceThreshold: 0.25,
+      mandatoryTools: ['GITHUB_CREATE_ISSUE'],
+      mandatoryToolkits: ['gmail'],
+    },
+  },
+});
+```
+
+- **`shadow`**: rank only, no filtering
+- **`soft`**: conservative filtering (larger retained set)
+- **`strict`**: aggressive filtering
+
+Safety behavior:
+
+- Low-confidence queries automatically fall back to unfiltered results
+- Previously used tools are preserved as an active-set lock
+- Mandatory tools/toolkits are always preserved
+
+When enabled, `session.tools()` also includes `COMPOSIO_REFRESH_TOOLS`:
+
+```typescript
+await session.execute('COMPOSIO_REFRESH_TOOLS', { keepCurrent: true });
+```
+
+- `keepCurrent: true` keeps active tool memory
+- `keepCurrent: false` clears adaptive session memory
+
+Filtering affects discovery (`session.search`) only; tool execution routing remains unchanged.
 
 ## Session Properties
 
